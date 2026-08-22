@@ -469,6 +469,8 @@ def test_main_dry_run_reports_matches_without_sending_or_saving(
         "PRODUCT_KEYWORDS: []\n"
         "MAX_BACKFILL_DAYS: 3650\n"
         "LOOKBACK_DAYS: 1\n"
+        "ENABLE_KEV: no\n"
+        "ENABLE_EPSS: no\n"
     )
 
     state = tmp_path / "state.json"
@@ -502,7 +504,8 @@ def test_main_saves_state_and_delivers_when_not_a_dry_run(
     monkeypatch.setattr(botpeas.time, "sleep", lambda _: None)
 
     config = tmp_path / "botpeas.yaml"
-    config.write_text("ALL_VALID: yes\nMAX_BACKFILL_DAYS: 3650\nLOOKBACK_DAYS: 1\n")
+    config.write_text("ALL_VALID: yes\nMAX_BACKFILL_DAYS: 3650\nLOOKBACK_DAYS: 1\n"
+                      "ENABLE_KEV: no\nENABLE_EPSS: no\n")
 
     state = tmp_path / "state.json"
     state.write_text(json.dumps({
@@ -533,7 +536,7 @@ def test_main_since_days_overrides_saved_state(tmp_path, monkeypatch, nvd_payloa
     monkeypatch.setattr(botpeas.time, "sleep", lambda _: None)
 
     config = tmp_path / "botpeas.yaml"
-    config.write_text("ALL_VALID: yes\n")
+    config.write_text("ALL_VALID: yes\nENABLE_KEV: no\nENABLE_EPSS: no\n")
 
     state = tmp_path / "state.json"
     state.write_text(json.dumps({
@@ -645,3 +648,432 @@ def test_telegram_labels_with_punctuation_are_escaped(polkit):
 
     assert "\\(limit 10\\)" in message
     assert "(limit 10)" not in message
+
+
+##################### CISA KEV #####################
+
+KEV_FIXTURE = pathlib.Path(__file__).parent / "kev_sample.json"
+
+
+@pytest.fixture
+def kev_payload():
+    with open(KEV_FIXTURE) as f:
+        return json.load(f)
+
+
+@pytest.fixture
+def kev_catalog(kev_payload):
+    session = FakeSession([FakeResponse(kev_payload)])
+    return botpeas.fetch_kev_catalog(session=session)
+
+
+def test_fetch_kev_catalog_keys_entries_by_cve_id(kev_catalog):
+    assert set(kev_catalog) == {"CVE-2021-4034", "CVE-2024-3400"}
+    assert kev_catalog["CVE-2021-4034"]["dueDate"] == "2022-07-18"
+
+
+def test_fetch_kev_catalog_skips_entries_without_a_cve_id(kev_catalog):
+    ''' The malformed third fixture entry must not become a None key '''
+
+    assert None not in kev_catalog
+    assert len(kev_catalog) == 2
+
+
+def test_load_kev_catalog_returns_empty_when_disabled(monkeypatch):
+    monkeypatch.setattr(botpeas, "ENABLE_KEV", False)
+
+    def explode(session=None):
+        raise AssertionError("KEV must not be fetched when disabled")
+
+    monkeypatch.setattr(botpeas, "fetch_kev_catalog", explode)
+    assert botpeas.load_kev_catalog() == {}
+
+
+def test_load_kev_catalog_degrades_instead_of_failing_the_run(monkeypatch, capsys):
+    ''' A CISA outage must not cost us the whole alerting run '''
+
+    monkeypatch.setattr(botpeas, "ENABLE_KEV", True)
+
+    def explode(session=None):
+        raise RuntimeError("CISA is down")
+
+    monkeypatch.setattr(botpeas, "fetch_kev_catalog", explode)
+
+    assert botpeas.load_kev_catalog() == {}
+    assert "WARNING" in capsys.readouterr().out
+
+
+##################### EPSS #####################
+
+def epss_response(entries):
+    return FakeResponse({"status": "OK", "status-code": 200, "version": "1.0",
+                         "total": len(entries), "offset": 0, "limit": 100,
+                         "data": entries})
+
+
+def test_fetch_epss_scores_converts_the_string_fields_to_floats():
+    session = FakeSession([epss_response([
+        {"cve": "CVE-2021-4034", "epss": "0.94776", "percentile": "0.99013",
+         "date": "2024-12-05"},
+    ])])
+
+    scores = botpeas.fetch_epss_scores(["CVE-2021-4034"], session=session)
+
+    assert scores["CVE-2021-4034"] == {"score": 0.94776, "percentile": 0.99013}
+
+
+def test_fetch_epss_scores_batches_large_id_lists(monkeypatch):
+    monkeypatch.setattr(botpeas, "EPSS_BATCH_SIZE", 100)
+    cve_ids = [f"CVE-2024-{i:05d}" for i in range(250)]
+    session = FakeSession([epss_response([]), epss_response([]), epss_response([])])
+
+    botpeas.fetch_epss_scores(cve_ids, session=session)
+
+    assert len(session.calls) == 3
+    assert len(session.calls[0]["cve"].split(",")) == 100
+    assert len(session.calls[2]["cve"].split(",")) == 50
+
+
+def test_fetch_epss_scores_skips_malformed_entries(capsys):
+    session = FakeSession([epss_response([
+        {"cve": "CVE-1", "epss": "not-a-number", "percentile": "0.5"},
+        {"cve": "CVE-2", "percentile": "0.5"},
+        {"epss": "0.1", "percentile": "0.5"},
+        {"cve": "CVE-3", "epss": "0.25", "percentile": "0.75"},
+    ])])
+
+    scores = botpeas.fetch_epss_scores(["CVE-1", "CVE-2", "CVE-3"], session=session)
+
+    assert set(scores) == {"CVE-3"}
+    assert scores["CVE-3"]["score"] == 0.25
+
+
+def test_fetch_epss_scores_makes_no_call_for_an_empty_list():
+    session = FakeSession([])
+    assert botpeas.fetch_epss_scores([], session=session) == {}
+    assert session.calls == []
+
+
+##################### ENRICHMENT #####################
+
+def test_enrich_attaches_kev_and_epss(polkit, coffee, kev_catalog, monkeypatch):
+    monkeypatch.setattr(botpeas, "ENABLE_EPSS", True)
+    monkeypatch.setattr(botpeas, "fetch_epss_scores", lambda ids, session=None: {
+        "CVE-2021-4034": {"score": 0.94776, "percentile": 0.99013},
+    })
+
+    botpeas.enrich_cves([polkit, coffee], kev_catalog)
+
+    assert polkit["kev"]["vendorProject"] == "Red Hat"
+    assert polkit["epss"]["score"] == 0.94776
+    # The coffee machine CVE is in neither source.
+    assert coffee["kev"] is None
+    assert coffee["epss"] is None
+
+
+def test_enrich_survives_an_epss_outage(polkit, kev_catalog, monkeypatch, capsys):
+    monkeypatch.setattr(botpeas, "ENABLE_EPSS", True)
+
+    def explode(ids, session=None):
+        raise RuntimeError("FIRST is down")
+
+    monkeypatch.setattr(botpeas, "fetch_epss_scores", explode)
+
+    botpeas.enrich_cves([polkit], kev_catalog)
+
+    # KEV enrichment still landed, and the CVE survives to be alerted on.
+    assert polkit["kev"] is not None
+    assert polkit["epss"] is None
+    assert "WARNING" in capsys.readouterr().out
+
+
+def test_enrich_skips_epss_when_disabled(polkit, kev_catalog, monkeypatch):
+    monkeypatch.setattr(botpeas, "ENABLE_EPSS", False)
+
+    def explode(ids, session=None):
+        raise AssertionError("EPSS must not be fetched when disabled")
+
+    monkeypatch.setattr(botpeas, "fetch_epss_scores", explode)
+
+    botpeas.enrich_cves([polkit], kev_catalog)
+    assert polkit["epss"] is None
+
+
+##################### THRESHOLDS #####################
+
+@pytest.fixture
+def thresholds(monkeypatch):
+    ''' Reset every gate to its permissive default before each threshold test '''
+
+    monkeypatch.setattr(botpeas, "MIN_CVSS", None)
+    monkeypatch.setattr(botpeas, "MIN_EPSS", None)
+    monkeypatch.setattr(botpeas, "KEV_ONLY", False)
+    monkeypatch.setattr(botpeas, "ALWAYS_ALERT_KEV", True)
+    monkeypatch.setattr(botpeas, "SKIP_UNSCORED", False)
+
+
+def test_no_thresholds_lets_everything_through(polkit, coffee, thresholds):
+    assert botpeas.passes_thresholds(polkit)
+    assert botpeas.passes_thresholds(coffee)
+
+
+def test_min_cvss_drops_low_scores(polkit, thresholds, monkeypatch):
+    monkeypatch.setattr(botpeas, "MIN_CVSS", 9.0)
+    assert not botpeas.passes_thresholds(polkit)  # scores 7.8
+
+    monkeypatch.setattr(botpeas, "MIN_CVSS", 7.0)
+    assert botpeas.passes_thresholds(polkit)
+
+
+def test_unscored_cves_pass_by_default(coffee, thresholds, monkeypatch):
+    ''' Brand new CVEs are often unscored; hiding them defeats the point '''
+
+    monkeypatch.setattr(botpeas, "MIN_CVSS", 9.0)
+    assert botpeas.passes_thresholds(coffee)
+
+
+def test_skip_unscored_drops_them_when_asked(coffee, thresholds, monkeypatch):
+    monkeypatch.setattr(botpeas, "MIN_CVSS", 9.0)
+    monkeypatch.setattr(botpeas, "SKIP_UNSCORED", True)
+    assert not botpeas.passes_thresholds(coffee)
+
+
+def test_min_epss_drops_unlikely_exploitation(polkit, thresholds, monkeypatch):
+    monkeypatch.setattr(botpeas, "MIN_EPSS", 0.5)
+
+    polkit["epss"] = {"score": 0.01, "percentile": 0.4}
+    assert not botpeas.passes_thresholds(polkit)
+
+    polkit["epss"] = {"score": 0.94, "percentile": 0.99}
+    assert botpeas.passes_thresholds(polkit)
+
+
+def test_kev_only_drops_everything_outside_the_catalog(polkit, coffee, thresholds,
+                                                       kev_catalog, monkeypatch):
+    monkeypatch.setattr(botpeas, "KEV_ONLY", True)
+    polkit["kev"] = kev_catalog["CVE-2021-4034"]
+
+    assert botpeas.passes_thresholds(polkit)
+    assert not botpeas.passes_thresholds(coffee)
+
+
+def test_kev_bypasses_the_score_thresholds(polkit, thresholds, kev_catalog, monkeypatch):
+    ''' Something already exploited matters whatever it scores '''
+
+    monkeypatch.setattr(botpeas, "MIN_CVSS", 10.0)
+    monkeypatch.setattr(botpeas, "MIN_EPSS", 0.99)
+    polkit["kev"] = kev_catalog["CVE-2021-4034"]
+
+    assert botpeas.passes_thresholds(polkit)
+
+
+def test_kev_bypass_can_be_turned_off(polkit, thresholds, kev_catalog, monkeypatch):
+    monkeypatch.setattr(botpeas, "MIN_CVSS", 10.0)
+    monkeypatch.setattr(botpeas, "ALWAYS_ALERT_KEV", False)
+    polkit["kev"] = kev_catalog["CVE-2021-4034"]
+
+    assert not botpeas.passes_thresholds(polkit)
+
+
+def test_filter_by_thresholds_reports_what_it_dropped(polkit, coffee, thresholds,
+                                                      monkeypatch, capsys):
+    monkeypatch.setattr(botpeas, "MIN_CVSS", 9.0)
+    monkeypatch.setattr(botpeas, "SKIP_UNSCORED", True)
+
+    kept = botpeas.filter_by_thresholds([polkit, coffee], "new")
+
+    assert kept == []
+    assert "Dropped 2 new CVE(s)" in capsys.readouterr().out
+
+
+##################### ENRICHED RENDERING #####################
+
+@pytest.fixture
+def enriched(polkit, kev_catalog):
+    polkit["kev"] = kev_catalog["CVE-2021-4034"]
+    polkit["epss"] = {"score": 0.94776, "percentile": 0.99013}
+    return polkit
+
+
+def test_format_kev_summarises_dates_and_ransomware_use(kev_catalog):
+    text = botpeas.format_kev(kev_catalog["CVE-2021-4034"])
+
+    assert text.startswith("actively exploited in the wild")
+    assert "added 2022-06-27" in text
+    assert "due 2022-07-18" in text
+    assert "known ransomware use" in text
+
+
+def test_format_kev_omits_ransomware_when_not_known(kev_catalog):
+    text = botpeas.format_kev(kev_catalog["CVE-2024-3400"])
+
+    assert "ransomware" not in text
+    assert "added 2024-04-12" in text
+
+
+def test_format_kev_handles_a_bare_entry():
+    assert botpeas.format_kev({"cveID": "CVE-X"}) == "actively exploited in the wild"
+
+
+@pytest.mark.parametrize("percentile,expected", [
+    (0.99013, "ranks above 99% of all CVEs"),
+    (0.09, "ranks above 9% of all CVEs"),
+    (0.5, "ranks above 50% of all CVEs"),
+])
+def test_format_epss_renders_probability_and_rank(percentile, expected):
+    """"top N%" would read as nonsense for the low-ranking bulk of the catalog."""
+
+    text = botpeas.format_epss({"score": 0.94776, "percentile": percentile})
+
+    assert "94.78%" in text
+    assert expected in text
+
+
+def test_new_cve_message_includes_kev_and_epss(enriched):
+    message = botpeas.build_message(enriched, [], botpeas.NTFY_FORMAT, is_new=True)
+
+    assert "CISA KEV: actively exploited in the wild" in message
+    assert "EPSS: 94.78%" in message
+    # They sit directly under the CVSS line, before the summary.
+    lines = message.split("\n")
+    assert lines[1].startswith("🔮")
+    assert lines[2].startswith("🔥")
+    assert lines[3].startswith("📈")
+    assert lines[4].startswith("📅")
+
+
+def test_modified_cve_message_includes_kev_and_epss(enriched):
+    message = botpeas.build_message(enriched, [], botpeas.NTFY_FORMAT, is_new=False)
+
+    assert message.startswith("📣")
+    assert "CISA KEV" in message
+    assert "EPSS" in message
+
+
+def test_messages_omit_enrichment_when_absent(polkit):
+    message = botpeas.build_message(polkit, [], botpeas.NTFY_FORMAT, is_new=True)
+
+    assert "CISA KEV" not in message
+    assert "EPSS" not in message
+
+
+@pytest.mark.parametrize("is_new", [True, False])
+def test_enriched_telegram_message_has_no_bare_reserved_characters(enriched, is_new):
+    ''' KEV dates and EPSS percentages add punctuation the escaper must catch '''
+
+    message = botpeas.build_message(enriched, [], botpeas.TELEGRAM_FORMAT, is_new=is_new)
+
+    remaining = re.sub(r"\\.", "", message, flags=re.S).replace("*", "")
+    assert [c for c in remaining if c in set("_[]()~`>#+-=|{}.!\\")] == []
+
+
+@pytest.mark.parametrize("fmt", [
+    botpeas.SLACK_FORMAT, botpeas.TELEGRAM_FORMAT, botpeas.DISCORD_FORMAT,
+    botpeas.NTFY_FORMAT, botpeas.PUSHOVER_FORMAT,
+])
+def test_enriched_messages_stay_within_each_sink_limit(enriched, fmt):
+    enriched["summary"] = "x" * 5000
+    enriched["references"] = [f"https://example.org/ref/{i}" for i in range(50)]
+
+    message = botpeas.build_message(enriched, [], fmt, is_new=True)
+    assert len(message) <= fmt.limit
+
+
+def test_ntfy_raises_priority_for_actively_exploited_cves(enriched, polkit, monkeypatch):
+    monkeypatch.setenv("NTFY_URL", "https://ntfy.example")
+    monkeypatch.setenv("NTFY_TOPIC", "cves")
+
+    sent = []
+
+    def fake_post(url, data=None, headers=None, timeout=None):
+        sent.append(headers)
+        return FakeResponse({}, status_code=200)
+
+    monkeypatch.setattr(botpeas.requests, "post", fake_post)
+
+    botpeas.send_ntfy_message(enriched, [], is_new=True)
+    assert sent[0]["Priority"] == "urgent"
+    assert sent[0]["Title"] == "Actively exploited CVE"
+
+    plain = dict(enriched, kev=None)
+    botpeas.send_ntfy_message(plain, [], is_new=True)
+    assert sent[1]["Priority"] == "high"
+    assert sent[1]["Title"] == "New CVE Alert"
+
+
+##################### END TO END WITH ENRICHMENT #####################
+
+def test_main_enriches_then_applies_thresholds(tmp_path, monkeypatch, nvd_payload,
+                                               kev_payload):
+    monkeypatch.setattr(botpeas.time, "sleep", lambda _: None)
+
+    config = tmp_path / "botpeas.yaml"
+    config.write_text(
+        "ALL_VALID: yes\n"
+        "MAX_BACKFILL_DAYS: 3650\n"
+        "ENABLE_KEV: yes\n"
+        "ENABLE_EPSS: yes\n"
+        "MIN_CVSS: 9.0\n"
+        "SKIP_UNSCORED: yes\n"
+    )
+
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({
+        "LAST_NEW_CVE": "2020-01-01T00:00:00",
+        "LAST_MODIFIED_CVE": "2020-01-01T00:00:00",
+    }))
+
+    monkeypatch.setattr(botpeas, "nvd_get", lambda params, session=None: {
+        "totalResults": 2, "resultsPerPage": 2,
+        "vulnerabilities": nvd_payload["vulnerabilities"],
+    })
+    monkeypatch.setattr(botpeas, "fetch_kev_catalog",
+                        lambda session=None: {v["cveID"]: v for v
+                                              in kev_payload["vulnerabilities"]
+                                              if v.get("cveID")})
+    monkeypatch.setattr(botpeas, "fetch_epss_scores", lambda ids, session=None: {
+        "CVE-2021-4034": {"score": 0.94776, "percentile": 0.99013},
+    })
+
+    sent = []
+    monkeypatch.setattr(botpeas, "SINKS", (lambda cve, expls, is_new: sent.append(cve),))
+
+    botpeas.main(["--config", str(config), "--state", str(state)])
+
+    # polkit scores 7.8, below MIN_CVSS 9.0, but it is in KEV so it still alerts.
+    # The coffee machine CVE is unscored and not in KEV, so SKIP_UNSCORED drops it.
+    assert [c["id"] for c in sent] == ["CVE-2021-4034"]
+    assert sent[0]["kev"]["vendorProject"] == "Red Hat"
+    assert sent[0]["epss"]["score"] == 0.94776
+
+
+def test_main_does_not_resurface_a_threshold_dropped_cve_as_modified(
+        tmp_path, monkeypatch, nvd_payload):
+    ''' A CVE dropped from the new pass must not reappear via the modified pass '''
+
+    monkeypatch.setattr(botpeas.time, "sleep", lambda _: None)
+
+    config = tmp_path / "botpeas.yaml"
+    config.write_text("ALL_VALID: yes\nMAX_BACKFILL_DAYS: 3650\n"
+                      "ENABLE_KEV: no\nENABLE_EPSS: no\n"
+                      "MIN_CVSS: 9.0\nSKIP_UNSCORED: yes\n")
+
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({
+        "LAST_NEW_CVE": "2020-01-01T00:00:00",
+        "LAST_MODIFIED_CVE": "2020-01-01T00:00:00",
+    }))
+
+    monkeypatch.setattr(botpeas, "nvd_get", lambda params, session=None: {
+        "totalResults": 2, "resultsPerPage": 2,
+        "vulnerabilities": nvd_payload["vulnerabilities"],
+    })
+
+    sent = []
+    monkeypatch.setattr(botpeas, "SINKS", (lambda cve, expls, is_new: sent.append(
+        (cve["id"], is_new)),))
+
+    botpeas.main(["--config", str(config), "--state", str(state)])
+
+    # Both CVEs fall below the threshold; neither may come back as "modified".
+    assert sent == []

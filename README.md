@@ -7,6 +7,17 @@ Use this bot to monitor new CVEs containing defined keywords and send alerts to 
 CVE data comes from the [NVD CVE API 2.0](https://nvd.nist.gov/developers/vulnerabilities),
 which is free and works without an API key.
 
+Alerts are enriched with two more free, keyless sources:
+
+- **[CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog)** — whether
+  the CVE is *already being exploited in the wild*, with the federal remediation
+  deadline and whether it is used in ransomware campaigns.
+- **[EPSS](https://www.first.org/epss/)** — the probability the CVE will be exploited in
+  the next 30 days, and how it ranks against every other CVE.
+
+Together they separate the CVSS 9.8 that nobody will ever exploit from the 6.5 that is
+already being weaponised.
+
 ## See it in action
 
 Join the telegram group **[peass](https://t.me/peass)** to see the bot in action and be up to date with the latest privilege escalation vulnerabilities.
@@ -40,6 +51,30 @@ Join the telegram group **[peass](https://t.me/peass)** to see the bot in action
 | `ALL_VALID` | `no` | Notify on every CVE, ignoring the keyword lists |
 | `MAX_BACKFILL_DAYS` | `7` | If the bot has been down a while, replay at most this many days instead of flooding your channels. `null` disables the limit |
 | `LOOKBACK_DAYS` | `1` | How far back to look on the very first run, when there is no saved state |
+| `ENABLE_KEV` | `yes` | Flag CVEs listed in the CISA KEV catalog |
+| `ENABLE_EPSS` | `yes` | Attach EPSS exploitation probabilities |
+| `MIN_CVSS` | `null` | Drop CVEs below this CVSS base score |
+| `MIN_EPSS` | `null` | Drop CVEs below this EPSS probability (`0.1` = 10%) |
+| `KEV_ONLY` | `no` | Alert only on CVEs in the KEV catalog |
+| `ALWAYS_ALERT_KEV` | `yes` | Let KEV entries through regardless of `MIN_CVSS`/`MIN_EPSS` |
+| `SKIP_UNSCORED` | `no` | Drop CVEs that have no score yet when a threshold is set |
+
+### A note on unscored CVEs
+
+Newly published CVEs frequently have no CVSS or EPSS score for days. By default they
+**pass** the thresholds rather than being hidden — a monitor that suppresses the newest
+CVEs defeats its own purpose. If you would rather trade that recall for less noise, set
+`SKIP_UNSCORED: yes`.
+
+### Suggested starting point
+
+Alert on everything your keywords match, but let anything actively exploited through
+no matter what:
+
+```yaml
+MIN_EPSS: 0.05          # at least a 5% chance of exploitation
+ALWAYS_ALERT_KEV: yes   # ...unless CISA says it is already happening
+```
 
 ## Running it locally
 

@@ -37,6 +37,15 @@ NVD_RESULTS_PER_PAGE = 2000
 NVD_SLEEP_NO_KEY = 6.0
 NVD_SLEEP_WITH_KEY = 0.6
 
+# CISA's catalog of vulnerabilities known to be exploited in the wild. Free, no key.
+KEV_CATALOG_URL = ("https://www.cisa.gov/sites/default/files/feeds/"
+                   "known_exploited_vulnerabilities.json")
+
+# FIRST's Exploit Prediction Scoring System: probability of exploitation in the
+# next 30 days. Free, no key, and accepts a comma-separated batch of CVE ids.
+EPSS_API_URL = "https://api.first.org/data/v1/epss"
+EPSS_BATCH_SIZE = 100
+
 HTTP_TIMEOUT = 60
 MAX_RETRIES = 4
 BACKOFF_BASE = 2
@@ -60,6 +69,14 @@ PRODUCT_KEYWORDS_I: list = []
 PRODUCT_KEYWORDS: list = []
 MAX_BACKFILL_DAYS = DEFAULT_MAX_BACKFILL_DAYS
 LOOKBACK_DAYS = DEFAULT_LOOKBACK_DAYS
+
+ENABLE_KEV = True
+ENABLE_EPSS = True
+MIN_CVSS = None
+MIN_EPSS = None
+KEV_ONLY = False
+ALWAYS_ALERT_KEV = True
+SKIP_UNSCORED = False
 
 LAST_NEW_CVE = datetime.datetime.utcnow() - datetime.timedelta(days=DEFAULT_LOOKBACK_DAYS)
 LAST_MODIFIED_CVE = datetime.datetime.utcnow() - datetime.timedelta(days=DEFAULT_LOOKBACK_DAYS)
@@ -86,6 +103,8 @@ def load_keywords(config_path=KEYWORDS_CONFIG_PATH):
     global DESCRIPTION_KEYWORDS_I, DESCRIPTION_KEYWORDS
     global PRODUCT_KEYWORDS_I, PRODUCT_KEYWORDS
     global MAX_BACKFILL_DAYS, LOOKBACK_DAYS
+    global ENABLE_KEV, ENABLE_EPSS, MIN_CVSS, MIN_EPSS
+    global KEV_ONLY, ALWAYS_ALERT_KEV, SKIP_UNSCORED
 
     with open(config_path, 'r') as yaml_file:
         keywords_config = yaml.safe_load(yaml_file) or {}
@@ -97,6 +116,14 @@ def load_keywords(config_path=KEYWORDS_CONFIG_PATH):
         PRODUCT_KEYWORDS = keywords_config.get("PRODUCT_KEYWORDS") or []
         MAX_BACKFILL_DAYS = keywords_config.get("MAX_BACKFILL_DAYS", DEFAULT_MAX_BACKFILL_DAYS)
         LOOKBACK_DAYS = keywords_config.get("LOOKBACK_DAYS", DEFAULT_LOOKBACK_DAYS)
+
+        ENABLE_KEV = keywords_config.get("ENABLE_KEV", True)
+        ENABLE_EPSS = keywords_config.get("ENABLE_EPSS", True)
+        MIN_CVSS = keywords_config.get("MIN_CVSS")
+        MIN_EPSS = keywords_config.get("MIN_EPSS")
+        KEV_ONLY = keywords_config.get("KEV_ONLY", False)
+        ALWAYS_ALERT_KEV = keywords_config.get("ALWAYS_ALERT_KEV", True)
+        SKIP_UNSCORED = keywords_config.get("SKIP_UNSCORED", False)
 
 
 def load_lasttimes(state_path=CVES_JSON_PATH):
@@ -169,23 +196,23 @@ def parse_cve_time(value: str) -> datetime.datetime:
     raise ValueError(f"Unrecognised timestamp: {value!r}")
 
 
-def nvd_get(params: dict, session=None) -> dict:
-    ''' GET the NVD API with retries and exponential backoff '''
+def http_get_json(url: str, params: dict = None, headers: dict = None, session=None,
+                  label: str = "HTTP") -> dict:
+    ''' GET a JSON endpoint with retries and exponential backoff '''
 
     session = session or requests
-    api_key = os.getenv('NVD_API_KEY')
-    headers = {"apiKey": api_key} if api_key else {}
 
     last_error = None
     for attempt in range(MAX_RETRIES):
         try:
-            r = session.get(NVD_API_URL, params=params, headers=headers, timeout=HTTP_TIMEOUT)
+            r = session.get(url, params=params or {}, headers=headers or {},
+                            timeout=HTTP_TIMEOUT)
 
             if r.status_code == 200:
                 return r.json()
 
             if r.status_code not in RETRYABLE_STATUS:
-                raise RuntimeError(f"NVD returned HTTP {r.status_code}: {r.text[:200]}")
+                raise RuntimeError(f"{label} returned HTTP {r.status_code}: {r.text[:200]}")
 
             last_error = f"HTTP {r.status_code}"
 
@@ -194,10 +221,20 @@ def nvd_get(params: dict, session=None) -> dict:
 
         if attempt < MAX_RETRIES - 1:
             delay = BACKOFF_BASE * (2 ** attempt)
-            print(f"NVD request failed ({last_error}); retrying in {delay}s")
+            print(f"{label} request failed ({last_error}); retrying in {delay}s")
             time.sleep(delay)
 
-    raise RuntimeError(f"NVD request failed after {MAX_RETRIES} attempts: {last_error}")
+    raise RuntimeError(f"{label} request failed after {MAX_RETRIES} attempts: {last_error}")
+
+
+def nvd_get(params: dict, session=None) -> dict:
+    ''' GET the NVD API with retries and exponential backoff '''
+
+    api_key = os.getenv('NVD_API_KEY')
+    headers = {"apiKey": api_key} if api_key else {}
+
+    return http_get_json(NVD_API_URL, params=params, headers=headers, session=session,
+                         label="NVD")
 
 
 def date_windows(start: datetime.datetime, end: datetime.datetime) -> Iterator[tuple]:
@@ -277,6 +314,9 @@ def normalize_cve(cve: dict) -> dict:
         "summary": extract_description(cve),
         "vulnerable_configuration": extract_cpes(cve),
         "references": extract_references(cve),
+        # Filled in later by enrich_cves(); present so renderers never KeyError.
+        "kev": None,
+        "epss": None,
     }
 
 
@@ -431,8 +471,140 @@ def is_prod_keyword_present(products: str):
 def search_exploits(cve: str) -> list:
     ''' Given a CVE it will search for public exploits to abuse it '''
 
-    # TODO: replace the retired Vulners integration with KEV/EPSS/PoC-in-GitHub lookups.
+    # TODO: replace the retired Vulners integration with PoC-in-GitHub / ExploitDB.
     return []
+
+
+################## ENRICHMENT: CISA KEV + EPSS ####################
+
+def fetch_kev_catalog(session=None) -> dict:
+    ''' Fetch the CISA Known Exploited Vulnerabilities catalog, keyed by CVE id '''
+
+    payload = http_get_json(KEV_CATALOG_URL, session=session, label="CISA KEV")
+
+    catalog = {}
+    for entry in payload.get("vulnerabilities") or []:
+        cve_id = entry.get("cveID")
+        if cve_id:
+            catalog[cve_id] = entry
+
+    return catalog
+
+
+def load_kev_catalog(session=None) -> dict:
+    ''' Fetch the KEV catalog, degrading to no enrichment rather than failing the run '''
+
+    if not ENABLE_KEV:
+        return {}
+
+    try:
+        catalog = fetch_kev_catalog(session=session)
+        print(f"Loaded {len(catalog)} CISA KEV entries")
+        return catalog
+
+    except Exception as e:
+        print(f"WARNING: could not load the CISA KEV catalog, continuing without it: {e}")
+        return {}
+
+
+def fetch_epss_scores(cve_ids: list, session=None) -> dict:
+    ''' Look up EPSS scores, batching ids into the sizes the API accepts '''
+
+    scores = {}
+
+    for start in range(0, len(cve_ids), EPSS_BATCH_SIZE):
+        batch = cve_ids[start:start + EPSS_BATCH_SIZE]
+
+        payload = http_get_json(
+            EPSS_API_URL,
+            params={"cve": ",".join(batch), "limit": len(batch)},
+            session=session,
+            label="EPSS",
+        )
+
+        for entry in payload.get("data") or []:
+            cve_id = entry.get("cve")
+            if not cve_id:
+                continue
+
+            # The API returns both figures as strings.
+            try:
+                scores[cve_id] = {
+                    "score": float(entry["epss"]),
+                    "percentile": float(entry["percentile"]),
+                }
+            except (KeyError, TypeError, ValueError):
+                print(f"Skipping malformed EPSS entry for {cve_id}")
+
+    return scores
+
+
+def enrich_cves(cves: list, kev_catalog: dict, session=None):
+    ''' Attach KEV and EPSS data to each CVE in place '''
+
+    for cve in cves:
+        cve["kev"] = kev_catalog.get(cve["id"])
+
+    if not ENABLE_EPSS or not cves:
+        return
+
+    cve_ids = [cve["id"] for cve in cves if cve["id"]]
+    if not cve_ids:
+        return
+
+    try:
+        scores = fetch_epss_scores(cve_ids, session=session)
+    except Exception as e:
+        print(f"WARNING: could not load EPSS scores, continuing without them: {e}")
+        return
+
+    for cve in cves:
+        cve["epss"] = scores.get(cve["id"])
+
+
+def passes_thresholds(cve: dict) -> bool:
+    ''' Apply the severity gates configured on top of the keyword match '''
+
+    in_kev = bool(cve.get("kev"))
+
+    if KEV_ONLY and not in_kev:
+        return False
+
+    # Something already exploited in the wild is worth knowing about whatever it scores.
+    if in_kev and ALWAYS_ALERT_KEV:
+        return True
+
+    if MIN_CVSS is not None:
+        score = cve.get("cvss")
+        if score is None:
+            # Freshly published CVEs are routinely unscored. Hiding them by default
+            # would suppress exactly the alerts this bot exists to deliver.
+            if SKIP_UNSCORED:
+                return False
+        elif score < MIN_CVSS:
+            return False
+
+    if MIN_EPSS is not None:
+        epss = cve.get("epss")
+        if not epss:
+            if SKIP_UNSCORED:
+                return False
+        elif epss["score"] < MIN_EPSS:
+            return False
+
+    return True
+
+
+def filter_by_thresholds(cves: list, label: str) -> list:
+    ''' Drop the CVEs that matched a keyword but fall below the configured gates '''
+
+    kept = [cve for cve in cves if passes_thresholds(cve)]
+
+    dropped = len(cves) - len(kept)
+    if dropped:
+        print(f"Dropped {dropped} {label} CVE(s) below the configured thresholds")
+
+    return kept
 
 
 #################### GENERATE MESSAGES #########################
@@ -509,6 +681,50 @@ def format_cvss(cve_data: dict) -> str:
     return f"{score} ({severity})" if severity else str(score)
 
 
+def format_kev(kev: dict) -> str:
+    ''' Summarise a CISA KEV entry: why it matters and by when '''
+
+    details = []
+
+    if kev.get("dateAdded"):
+        details.append(f"added {kev['dateAdded']}")
+
+    if kev.get("dueDate"):
+        details.append(f"US federal remediation due {kev['dueDate']}")
+
+    if (kev.get("knownRansomwareCampaignUse") or "").lower() == "known":
+        details.append("known ransomware use")
+
+    summary = "actively exploited in the wild"
+    return f"{summary} ({', '.join(details)})" if details else summary
+
+
+def format_epss(epss: dict) -> str:
+    ''' Render EPSS as a probability plus how it ranks against every other CVE '''
+
+    # "ranks above N%" rather than "top N%": the latter reads as nonsense for the
+    # low-percentile CVEs that make up most of the catalog.
+    return (f"{epss['score']:.2%} chance of exploitation in the next 30 days "
+            f"(ranks above {epss['percentile']:.0%} of all CVEs)")
+
+
+def enrichment_lines(cve_data: dict, fmt: Format) -> list:
+    ''' The KEV and EPSS lines shared by the new and modified CVE messages '''
+
+    e, b = fmt.escape, fmt.bold
+    lines = []
+
+    kev = cve_data.get("kev")
+    if kev:
+        lines.append(f"🔥  {b(e('CISA KEV'))}{e(': ' + format_kev(kev))}")
+
+    epss = cve_data.get("epss")
+    if epss:
+        lines.append(f"📈  {b(e('EPSS'))}{e(': ' + format_epss(epss))}")
+
+    return lines
+
+
 def generate_new_cve_message(cve_data: dict, fmt: Format = NTFY_FORMAT) -> str:
     ''' Generate new CVE message for the given sink format '''
 
@@ -526,6 +742,9 @@ def generate_new_cve_message(cve_data: dict, fmt: Format = NTFY_FORMAT) -> str:
         f"📅  {b(e('Published'))}{e(': ')}{e(cve_data['Published'])}",
         f"📓  {b(e('Summary'))}{e(': ')}{e(summary)}",
     ]
+
+    # KEV and EPSS sit right under the score: they are what makes it actionable.
+    lines[2:2] = enrichment_lines(cve_data, fmt)
 
     if cve_data["vulnerable_configuration"]:
         vulnerable = ", ".join(cve_data["vulnerable_configuration"][:MAX_CPES_SHOWN])
@@ -551,7 +770,10 @@ def generate_modified_cve_message(cve_data: dict, fmt: Format = NTFY_FORMAT) -> 
     tail = (f" ({format_cvss(cve_data)}) was modified on {modified} "
             f"(originally published {published})")
 
-    return f"📣 {b(e(cve_data['id']))}{e(tail)}"
+    lines = [f"📣 {b(e(cve_data['id']))}{e(tail)}"]
+    lines.extend(enrichment_lines(cve_data, fmt))
+
+    return "\n".join(lines)
 
 
 def generate_public_expls_message(public_expls: list, fmt: Format = NTFY_FORMAT) -> str:
@@ -715,10 +937,11 @@ def send_ntfy_message(cve_data: dict, public_expls: list, is_new: bool):
 
     full_ntfy_url = f"{ntfy_url.rstrip('/')}/{ntfy_topic}"
 
-    headers = {
-        "Title": "New CVE Alert",
-        "Priority": "high",
-    }
+    # Something already being exploited deserves to cut through on a phone.
+    if cve_data.get("kev"):
+        headers = {"Title": "Actively exploited CVE", "Priority": "urgent"}
+    else:
+        headers = {"Title": "New CVE Alert", "Priority": "high"}
 
     if ntfy_auth:
         headers["Authorization"] = ntfy_auth
@@ -790,11 +1013,18 @@ def main(argv=None):
     else:
         load_lasttimes(args.state)
 
+    # Load the KEV catalog once and reuse it for both passes
+    kev_catalog = load_kev_catalog()
+
     # Find and publish new CVEs
     new_cves = get_new_cves()
+    enrich_cves(new_cves, kev_catalog)
 
+    # Capture the ids before the thresholds run, so a CVE dropped here cannot
+    # reappear moments later as a "modified" alert.
     new_cves_ids = [ncve['id'] for ncve in new_cves]
-    print(f"New CVEs discovered: {new_cves_ids}")
+    new_cves = filter_by_thresholds(new_cves, "new")
+    print(f"New CVEs discovered: {[ncve['id'] for ncve in new_cves]}")
 
     for new_cve in new_cves:
         public_exploits = search_exploits(new_cve['id'])
@@ -804,8 +1034,9 @@ def main(argv=None):
     modified_cves = get_modified_cves()
 
     modified_cves = [mcve for mcve in modified_cves if mcve['id'] not in new_cves_ids]
-    modified_cves_ids = [mcve['id'] for mcve in modified_cves]
-    print(f"Modified CVEs discovered: {modified_cves_ids}")
+    enrich_cves(modified_cves, kev_catalog)
+    modified_cves = filter_by_thresholds(modified_cves, "modified")
+    print(f"Modified CVEs discovered: {[mcve['id'] for mcve in modified_cves]}")
 
     for modified_cve in modified_cves:
         public_exploits = search_exploits(modified_cve['id'])

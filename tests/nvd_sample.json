@@ -1,0 +1,102 @@
+{
+  "resultsPerPage": 2,
+  "startIndex": 0,
+  "totalResults": 2,
+  "format": "NVD_CVE",
+  "version": "2.0",
+  "timestamp": "2024-12-05T05:15:00.000",
+  "vulnerabilities": [
+    {
+      "cve": {
+        "id": "CVE-2021-4034",
+        "sourceIdentifier": "secalert@redhat.com",
+        "published": "2022-01-28T19:15:09.777",
+        "lastModified": "2023-11-07T03:39:52.833",
+        "vulnStatus": "Analyzed",
+        "descriptions": [
+          {
+            "lang": "es",
+            "value": "Se ha encontrado una vulnerabilidad de escalada de privilegios locales."
+          },
+          {
+            "lang": "en",
+            "value": "A local privilege escalation vulnerability was found on polkit's pkexec utility. The pkexec application is a setuid tool designed to allow unprivileged users to run commands as privileged users."
+          }
+        ],
+        "metrics": {
+          "cvssMetricV31": [
+            {
+              "source": "nvd@nist.gov",
+              "type": "Primary",
+              "cvssData": {
+                "version": "3.1",
+                "vectorString": "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+                "baseScore": 7.8,
+                "baseSeverity": "HIGH"
+              },
+              "exploitabilityScore": 1.8,
+              "impactScore": 5.9
+            }
+          ],
+          "cvssMetricV2": [
+            {
+              "source": "nvd@nist.gov",
+              "type": "Primary",
+              "cvssData": {
+                "version": "2.0",
+                "vectorString": "AV:L/AC:L/Au:N/C:C/I:C/A:C",
+                "baseScore": 7.2
+              },
+              "baseSeverity": "HIGH"
+            }
+          ]
+        },
+        "configurations": [
+          {
+            "nodes": [
+              {
+                "operator": "OR",
+                "negate": false,
+                "cpeMatch": [
+                  {
+                    "vulnerable": true,
+                    "criteria": "cpe:2.3:a:polkit_project:polkit:*:*:*:*:*:*:*:*",
+                    "matchCriteriaId": "AAAA"
+                  },
+                  {
+                    "vulnerable": true,
+                    "criteria": "cpe:2.3:o:redhat:enterprise_linux:8.0:*:*:*:*:*:*:*",
+                    "matchCriteriaId": "BBBB"
+                  },
+                  {
+                    "vulnerable": true,
+                    "criteria": "cpe:2.3:a:polkit_project:polkit:*:*:*:*:*:*:*:*",
+                    "matchCriteriaId": "AAAA"
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "references": [
+          {"url": "https://example.org/advisory?id=1&x=2", "source": "secalert@redhat.com", "tags": ["Vendor Advisory"]},
+          {"url": "https://example.org/patch-1.0_final(rev2)", "source": "secalert@redhat.com"},
+          {"url": "https://example.org/advisory?id=1&x=2", "source": "duplicate"}
+        ]
+      }
+    },
+    {
+      "cve": {
+        "id": "CVE-2024-99999",
+        "published": "2024-12-05T05:15:00.000",
+        "lastModified": "2024-12-05T05:15:00.000",
+        "vulnStatus": "Awaiting Analysis",
+        "descriptions": [
+          {"lang": "en", "value": "An unrelated flaw in a coffee machine firmware."}
+        ],
+        "metrics": {},
+        "references": []
+      }
+    }
+  ]
+}

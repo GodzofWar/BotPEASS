@@ -36,3 +36,11 @@ PRODUCT_KEYWORDS_I:
 
 PRODUCT_KEYWORDS:
 - ThisIsACaseSensitiveExample
+
+# If the bot has not run for a while, only replay this many days of CVEs
+# rather than flooding every channel with months of backlog.
+# Set to null to disable the limit.
+MAX_BACKFILL_DAYS: 7
+
+# How far back to look when there is no saved state at all.
+LOOKBACK_DAYS: 1

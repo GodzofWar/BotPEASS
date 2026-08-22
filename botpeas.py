@@ -1,28 +1,85 @@
-import requests
+#!/usr/bin/env python3
+"""BotPEASS - monitor new/modified CVEs matching configured keywords and alert on them.
+
+Data comes from the NVD CVE API 2.0 (https://services.nvd.nist.gov/rest/json/cves/2.0),
+which is free and works without an API key. Setting NVD_API_KEY raises the rate limit
+from 5 to 50 requests per 30s window.
+"""
+
+from __future__ import annotations
+
+import argparse
 import datetime
-import pathlib
 import json
 import os
-import yaml
-import vulners
-
-from os.path import join
+import pathlib
+import sys
+import time
+from dataclasses import dataclass
 from enum import Enum
-from discord import Webhook, RequestsWebhookAdapter
+from typing import Callable, Iterator
 
+import requests
+import yaml
 
-CIRCL_LU_URL = "https://cve.circl.lu/api/query"
-CVES_JSON_PATH = join(pathlib.Path(__file__).parent.absolute(), "output/botpeas.json")
-LAST_NEW_CVE = datetime.datetime.now() - datetime.timedelta(days=1)
-LAST_MODIFIED_CVE = datetime.datetime.now() - datetime.timedelta(days=1)
+BASE_DIR = pathlib.Path(__file__).parent.absolute()
+CVES_JSON_PATH = BASE_DIR / "output" / "botpeas.json"
+KEYWORDS_CONFIG_PATH = BASE_DIR / "config" / "botpeas.yaml"
+
 TIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
 
-KEYWORDS_CONFIG_PATH = join(pathlib.Path(__file__).parent.absolute(), "config/botpeas.yaml")
+NVD_API_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+NVD_PARAM_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S.000"
+# The NVD API refuses date ranges wider than 120 days, so long backfills are chunked.
+NVD_MAX_RANGE_DAYS = 120
+NVD_RESULTS_PER_PAGE = 2000
+# NVD asks for ~6s between requests without a key; an API key allows a far higher rate.
+NVD_SLEEP_NO_KEY = 6.0
+NVD_SLEEP_WITH_KEY = 0.6
+
+# CISA's catalog of vulnerabilities known to be exploited in the wild. Free, no key.
+KEV_CATALOG_URL = ("https://www.cisa.gov/sites/default/files/feeds/"
+                   "known_exploited_vulnerabilities.json")
+
+# FIRST's Exploit Prediction Scoring System: probability of exploitation in the
+# next 30 days. Free, no key, and accepts a comma-separated batch of CVE ids.
+EPSS_API_URL = "https://api.first.org/data/v1/epss"
+EPSS_BATCH_SIZE = 100
+
+HTTP_TIMEOUT = 60
+MAX_RETRIES = 4
+BACKOFF_BASE = 2
+RETRYABLE_STATUS = {403, 408, 429, 500, 502, 503, 504}
+
+SUMMARY_LIMIT = 500
+MAX_CPES_SHOWN = 10
+MAX_REFS_SHOWN = 5
+MAX_EXPLOITS_SHOWN = 20
+
+# Preference order when a CVE carries several scoring systems.
+CVSS_METRIC_KEYS = ("cvssMetricV40", "cvssMetricV31", "cvssMetricV30", "cvssMetricV2")
+
+DEFAULT_LOOKBACK_DAYS = 1
+DEFAULT_MAX_BACKFILL_DAYS = 7
+
 ALL_VALID = False
-DESCRIPTION_KEYWORDS_I = []
-DESCRIPTION_KEYWORDS = []
-PRODUCT_KEYWORDS_I = []
-PRODUCT_KEYWORDS = []
+DESCRIPTION_KEYWORDS_I: list = []
+DESCRIPTION_KEYWORDS: list = []
+PRODUCT_KEYWORDS_I: list = []
+PRODUCT_KEYWORDS: list = []
+MAX_BACKFILL_DAYS = DEFAULT_MAX_BACKFILL_DAYS
+LOOKBACK_DAYS = DEFAULT_LOOKBACK_DAYS
+
+ENABLE_KEV = True
+ENABLE_EPSS = True
+MIN_CVSS = None
+MIN_EPSS = None
+KEV_ONLY = False
+ALWAYS_ALERT_KEV = True
+SKIP_UNSCORED = False
+
+LAST_NEW_CVE = datetime.datetime.utcnow() - datetime.timedelta(days=DEFAULT_LOOKBACK_DAYS)
+LAST_MODIFIED_CVE = datetime.datetime.utcnow() - datetime.timedelta(days=DEFAULT_LOOKBACK_DAYS)
 
 
 class Time_Type(Enum):
@@ -30,121 +87,365 @@ class Time_Type(Enum):
     LAST_MODIFIED = "last-modified"
 
 
+# NVD names the two date-range filters differently from our internal field names.
+NVD_DATE_PARAMS = {
+    Time_Type.PUBLISHED: ("pubStartDate", "pubEndDate"),
+    Time_Type.LAST_MODIFIED: ("lastModStartDate", "lastModEndDate"),
+}
+
+
 ################## LOAD CONFIGURATIONS ####################
 
-def load_keywords():
+def load_keywords(config_path=KEYWORDS_CONFIG_PATH):
     ''' Load keywords from config file '''
 
     global ALL_VALID
     global DESCRIPTION_KEYWORDS_I, DESCRIPTION_KEYWORDS
     global PRODUCT_KEYWORDS_I, PRODUCT_KEYWORDS
-    global NTFY_URL, NTFY_TOPIC, NTFY_AUTH
+    global MAX_BACKFILL_DAYS, LOOKBACK_DAYS
+    global ENABLE_KEV, ENABLE_EPSS, MIN_CVSS, MIN_EPSS
+    global KEV_ONLY, ALWAYS_ALERT_KEV, SKIP_UNSCORED
 
-    with open(KEYWORDS_CONFIG_PATH, 'r') as yaml_file:
-        keywords_config = yaml.safe_load(yaml_file)
+    with open(config_path, 'r') as yaml_file:
+        keywords_config = yaml.safe_load(yaml_file) or {}
         print(f"Loaded keywords: {keywords_config}")
-        ALL_VALID = keywords_config["ALL_VALID"]
-        DESCRIPTION_KEYWORDS_I = keywords_config["DESCRIPTION_KEYWORDS_I"]
-        DESCRIPTION_KEYWORDS = keywords_config["DESCRIPTION_KEYWORDS"]
-        PRODUCT_KEYWORDS_I = keywords_config["PRODUCT_KEYWORDS_I"]
-        PRODUCT_KEYWORDS = keywords_config["PRODUCT_KEYWORDS"]
-        #NTFY_URL = keywords_config.get("NTFY_URL", "")
-        #NTFY_TOPIC = keywords_config.get("NTFY_TOPIC", "")
-        #NTFY_AUTH = keywords_config.get("NTFY_AUTH", "")
+        ALL_VALID = keywords_config.get("ALL_VALID", False)
+        DESCRIPTION_KEYWORDS_I = keywords_config.get("DESCRIPTION_KEYWORDS_I") or []
+        DESCRIPTION_KEYWORDS = keywords_config.get("DESCRIPTION_KEYWORDS") or []
+        PRODUCT_KEYWORDS_I = keywords_config.get("PRODUCT_KEYWORDS_I") or []
+        PRODUCT_KEYWORDS = keywords_config.get("PRODUCT_KEYWORDS") or []
+        MAX_BACKFILL_DAYS = keywords_config.get("MAX_BACKFILL_DAYS", DEFAULT_MAX_BACKFILL_DAYS)
+        LOOKBACK_DAYS = keywords_config.get("LOOKBACK_DAYS", DEFAULT_LOOKBACK_DAYS)
+
+        ENABLE_KEV = keywords_config.get("ENABLE_KEV", True)
+        ENABLE_EPSS = keywords_config.get("ENABLE_EPSS", True)
+        MIN_CVSS = keywords_config.get("MIN_CVSS")
+        MIN_EPSS = keywords_config.get("MIN_EPSS")
+        KEV_ONLY = keywords_config.get("KEV_ONLY", False)
+        ALWAYS_ALERT_KEV = keywords_config.get("ALWAYS_ALERT_KEV", True)
+        SKIP_UNSCORED = keywords_config.get("SKIP_UNSCORED", False)
 
 
-def load_lasttimes():
+def load_lasttimes(state_path=CVES_JSON_PATH):
     ''' Load lasttimes from json file '''
 
     global LAST_NEW_CVE, LAST_MODIFIED_CVE
 
-    try:
-        with open(CVES_JSON_PATH, 'r') as json_file:
-            cves_time = json.load(json_file)
-            LAST_NEW_CVE = datetime.datetime.strptime(cves_time["LAST_NEW_CVE"], TIME_FORMAT)
-            LAST_MODIFIED_CVE = datetime.datetime.strptime(cves_time["LAST_MODIFIED_CVE"], TIME_FORMAT)
+    default = datetime.datetime.utcnow() - datetime.timedelta(days=LOOKBACK_DAYS)
+    LAST_NEW_CVE = default
+    LAST_MODIFIED_CVE = default
 
-    except Exception as e: #If error, just keep the fault date (today - 1 day)
+    try:
+        with open(state_path, 'r') as json_file:
+            cves_time = json.load(json_file)
+            LAST_NEW_CVE = parse_cve_time(cves_time["LAST_NEW_CVE"])
+            LAST_MODIFIED_CVE = parse_cve_time(cves_time["LAST_MODIFIED_CVE"])
+
+    except Exception as e:  # If error, just keep the default date (today - LOOKBACK_DAYS)
         print(f"ERROR, using default last times.\n{e}")
-        pass
+
+    # A long-dormant bot would otherwise replay months of CVEs in a single burst.
+    LAST_NEW_CVE = clamp_backfill(LAST_NEW_CVE, "LAST_NEW_CVE")
+    LAST_MODIFIED_CVE = clamp_backfill(LAST_MODIFIED_CVE, "LAST_MODIFIED_CVE")
 
     print(f"Last new cve: {LAST_NEW_CVE}")
     print(f"Last modified cve: {LAST_MODIFIED_CVE}")
 
 
-def update_lasttimes():
+def clamp_backfill(last_time: datetime.datetime, label: str) -> datetime.datetime:
+    ''' Refuse to replay more than MAX_BACKFILL_DAYS worth of CVEs at once '''
+
+    if MAX_BACKFILL_DAYS is None:
+        return last_time
+
+    oldest = datetime.datetime.utcnow() - datetime.timedelta(days=MAX_BACKFILL_DAYS)
+    if last_time < oldest:
+        print(f"WARNING: {label} ({last_time}) is older than MAX_BACKFILL_DAYS "
+              f"({MAX_BACKFILL_DAYS}); clamping to {oldest} to avoid an alert flood.")
+        return oldest
+
+    return last_time
+
+
+def update_lasttimes(state_path=CVES_JSON_PATH):
     ''' Save lasttimes in json file '''
 
-    with open(CVES_JSON_PATH, 'w') as json_file:
+    pathlib.Path(state_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(state_path, 'w') as json_file:
         json.dump({
             "LAST_NEW_CVE": LAST_NEW_CVE.strftime(TIME_FORMAT),
             "LAST_MODIFIED_CVE": LAST_MODIFIED_CVE.strftime(TIME_FORMAT),
         }, json_file)
 
 
+################## NVD API ####################
+
+def parse_cve_time(value: str) -> datetime.datetime:
+    ''' Parse the timestamp formats NVD and the state file use, as naive UTC '''
+
+    value = value.strip()
+    if value.endswith("Z"):
+        value = value[:-1]
+
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
+        try:
+            return datetime.datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+
+    raise ValueError(f"Unrecognised timestamp: {value!r}")
+
+
+def http_get_json(url: str, params: dict = None, headers: dict = None, session=None,
+                  label: str = "HTTP") -> dict:
+    ''' GET a JSON endpoint with retries and exponential backoff '''
+
+    session = session or requests
+
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = session.get(url, params=params or {}, headers=headers or {},
+                            timeout=HTTP_TIMEOUT)
+
+            if r.status_code == 200:
+                return r.json()
+
+            if r.status_code not in RETRYABLE_STATUS:
+                raise RuntimeError(f"{label} returned HTTP {r.status_code}: {r.text[:200]}")
+
+            last_error = f"HTTP {r.status_code}"
+
+        except (requests.RequestException, ValueError) as e:
+            last_error = str(e)
+
+        if attempt < MAX_RETRIES - 1:
+            delay = BACKOFF_BASE * (2 ** attempt)
+            print(f"{label} request failed ({last_error}); retrying in {delay}s")
+            time.sleep(delay)
+
+    raise RuntimeError(f"{label} request failed after {MAX_RETRIES} attempts: {last_error}")
+
+
+def nvd_get(params: dict, session=None) -> dict:
+    ''' GET the NVD API with retries and exponential backoff '''
+
+    api_key = os.getenv('NVD_API_KEY')
+    headers = {"apiKey": api_key} if api_key else {}
+
+    return http_get_json(NVD_API_URL, params=params, headers=headers, session=session,
+                         label="NVD")
+
+
+def date_windows(start: datetime.datetime, end: datetime.datetime) -> Iterator[tuple]:
+    ''' Split [start, end] into chunks the NVD API will accept '''
+
+    span = datetime.timedelta(days=NVD_MAX_RANGE_DAYS)
+    while start < end:
+        chunk_end = min(start + span, end)
+        yield start, chunk_end
+        start = chunk_end
+
+
+def get_cves(tt_filter: Time_Type, start: datetime.datetime, end: datetime.datetime,
+             session=None) -> list:
+    ''' Retrieve every CVE in the given window, following pagination '''
+
+    start_param, end_param = NVD_DATE_PARAMS[tt_filter]
+    sleep_between = NVD_SLEEP_WITH_KEY if os.getenv('NVD_API_KEY') else NVD_SLEEP_NO_KEY
+
+    results = []
+    seen_ids = set()
+    first_request = True
+
+    for window_start, window_end in date_windows(start, end):
+        start_index = 0
+
+        while True:
+            if not first_request:
+                time.sleep(sleep_between)
+            first_request = False
+
+            params = {
+                start_param: window_start.strftime(NVD_PARAM_TIME_FORMAT),
+                end_param: window_end.strftime(NVD_PARAM_TIME_FORMAT),
+                "resultsPerPage": NVD_RESULTS_PER_PAGE,
+                "startIndex": start_index,
+            }
+
+            payload = nvd_get(params, session=session)
+            vulnerabilities = payload.get("vulnerabilities") or []
+
+            for vulnerability in vulnerabilities:
+                if not vulnerability.get("cve"):
+                    continue
+
+                normalized = normalize_cve(vulnerability["cve"])
+                # NVD date ranges are inclusive at both ends, so a CVE sitting on a
+                # chunk boundary comes back in two windows. Alert on it once.
+                if normalized["id"] in seen_ids:
+                    continue
+
+                seen_ids.add(normalized["id"])
+                results.append(normalized)
+
+            total = payload.get("totalResults", 0)
+            # Fall back to the batch size we actually got: a resultsPerPage of 0
+            # alongside a non-empty page would never advance the cursor.
+            start_index += payload.get("resultsPerPage") or len(vulnerabilities)
+
+            if start_index >= total or not vulnerabilities:
+                break
+
+    return results
+
+
+def normalize_cve(cve: dict) -> dict:
+    ''' Flatten an NVD 2.0 record into the shape the filters and renderers expect '''
+
+    score, severity = extract_cvss(cve)
+
+    return {
+        "id": cve.get("id", ""),
+        "cvss": score,
+        "cvss_severity": severity,
+        "Published": normalize_timestamp(cve.get("published", "")),
+        "last-modified": normalize_timestamp(cve.get("lastModified", "")),
+        "summary": extract_description(cve),
+        "vulnerable_configuration": extract_cpes(cve),
+        "references": extract_references(cve),
+        # Filled in later by enrich_cves(); present so renderers never KeyError.
+        "kev": None,
+        "epss": None,
+    }
+
+
+def normalize_timestamp(value: str) -> str:
+    ''' Render an NVD timestamp in the state file's format, tolerating junk '''
+
+    if not value:
+        return ""
+
+    try:
+        return parse_cve_time(value).strftime(TIME_FORMAT)
+    except ValueError:
+        return value
+
+
+def extract_description(cve: dict) -> str:
+    ''' Prefer the English description, fall back to whatever is available '''
+
+    descriptions = cve.get("descriptions") or []
+    for description in descriptions:
+        if description.get("lang") == "en":
+            return description.get("value", "")
+
+    return descriptions[0].get("value", "") if descriptions else ""
+
+
+def extract_cvss(cve: dict) -> tuple:
+    ''' Return (base score, severity) from the most recent scoring system present '''
+
+    metrics = cve.get("metrics") or {}
+
+    for key in CVSS_METRIC_KEYS:
+        entries = metrics.get(key) or []
+        if not entries:
+            continue
+
+        primary = next((e for e in entries if e.get("type") == "Primary"), entries[0])
+        cvss_data = primary.get("cvssData") or {}
+        score = cvss_data.get("baseScore")
+
+        if score is None:
+            continue
+
+        # CVSS v2 keeps the severity beside cvssData rather than inside it.
+        severity = cvss_data.get("baseSeverity") or primary.get("baseSeverity")
+        return float(score), severity
+
+    return None, None
+
+
+def extract_cpes(cve: dict) -> list:
+    ''' Collect the vulnerable CPE strings, de-duplicated and order preserved '''
+
+    configurations = cve.get("configurations") or []
+    if isinstance(configurations, dict):  # Older 2.0 responses wrapped nodes in a dict
+        configurations = [configurations]
+
+    cpes = []
+    for configuration in configurations:
+        for node in configuration.get("nodes") or []:
+            for match in node.get("cpeMatch") or []:
+                criteria = match.get("criteria")
+                if criteria and criteria not in cpes:
+                    cpes.append(criteria)
+
+    return cpes
+
+
+def extract_references(cve: dict) -> list:
+    ''' Collect reference URLs, de-duplicated and order preserved '''
+
+    urls = []
+    for reference in cve.get("references") or []:
+        url = reference.get("url")
+        if url and url not in urls:
+            urls.append(url)
+
+    return urls
+
 
 ################## SEARCH CVES ####################
 
-def get_cves(tt_filter:Time_Type) -> dict:
-    ''' Given the headers for the API retrive CVEs from cve.circl.lu '''
-    now = datetime.datetime.now() - datetime.timedelta(days=1)
-    now_str = now.strftime("%d-%m-%Y")
-
-    headers = {
-        "time_modifier": "from",
-        "time_start": now_str,
-        "time_type": tt_filter.value,
-        "limit": "100",
-    }
-    r = requests.get(CIRCL_LU_URL, headers=headers)
-
-    return r.json()
-
-
-def get_new_cves() -> list:
+def get_new_cves(session=None) -> list:
     ''' Get CVEs that are new '''
 
     global LAST_NEW_CVE
 
-    cves = get_cves(Time_Type.PUBLISHED)
-    filtered_cves, new_last_time = filter_cves(
-            cves["results"],
-            LAST_NEW_CVE,
-            Time_Type.PUBLISHED
-        )
+    now = datetime.datetime.utcnow()
+    cves = get_cves(Time_Type.PUBLISHED, LAST_NEW_CVE, now, session=session)
+    filtered_cves, new_last_time = filter_cves(cves, LAST_NEW_CVE, Time_Type.PUBLISHED)
     LAST_NEW_CVE = new_last_time
 
     return filtered_cves
 
 
-def get_modified_cves() -> list:
-    ''' Get CVEs that has been modified '''
+def get_modified_cves(session=None) -> list:
+    ''' Get CVEs that have been modified '''
 
     global LAST_MODIFIED_CVE
 
-    cves = get_cves(Time_Type.LAST_MODIFIED)
-    filtered_cves, new_last_time = filter_cves(
-            cves["results"],
-            LAST_MODIFIED_CVE,
-            Time_Type.PUBLISHED
-        )
+    now = datetime.datetime.utcnow()
+    cves = get_cves(Time_Type.LAST_MODIFIED, LAST_MODIFIED_CVE, now, session=session)
+    filtered_cves, new_last_time = filter_cves(cves, LAST_MODIFIED_CVE, Time_Type.LAST_MODIFIED)
     LAST_MODIFIED_CVE = new_last_time
 
     return filtered_cves
 
 
-def filter_cves(cves: list, last_time: datetime.datetime, tt_filter: Time_Type) -> list:
-    ''' Filter by time the given list of CVEs '''
+def filter_cves(cves: list, last_time: datetime.datetime, tt_filter: Time_Type) -> tuple:
+    ''' Filter by time and keywords the given list of CVEs '''
 
     filtered_cves = []
     new_last_time = last_time
 
     for cve in cves:
-        cve_time = datetime.datetime.strptime(cve[tt_filter.value], TIME_FORMAT)
+        raw_time = cve.get(tt_filter.value)
+        if not raw_time:
+            continue
+
+        try:
+            cve_time = parse_cve_time(raw_time)
+        except ValueError:
+            print(f"Skipping {cve.get('id')}: unparsable {tt_filter.value} {raw_time!r}")
+            continue
+
         if cve_time > last_time:
             if ALL_VALID or is_summ_keyword_present(cve["summary"]) or \
-                is_prod_keyword_present(str(cve["vulnerable_configuration"])):
-                
+                    is_prod_keyword_present(str(cve["vulnerable_configuration"])):
+
                 filtered_cves.append(cve)
 
         if cve_time > new_last_time:
@@ -157,79 +458,354 @@ def is_summ_keyword_present(summary: str):
     ''' Given the summary check if any keyword is present '''
 
     return any(w in summary for w in DESCRIPTION_KEYWORDS) or \
-            any(w.lower() in summary.lower() for w in DESCRIPTION_KEYWORDS_I)
+        any(w.lower() in summary.lower() for w in DESCRIPTION_KEYWORDS_I)
 
 
 def is_prod_keyword_present(products: str):
-    ''' Given the summary check if any keyword is present '''
-    
+    ''' Given the products check if any keyword is present '''
+
     return any(w in products for w in PRODUCT_KEYWORDS) or \
-            any(w.lower() in products.lower() for w in PRODUCT_KEYWORDS_I)
+        any(w.lower() in products.lower() for w in PRODUCT_KEYWORDS_I)
 
 
 def search_exploits(cve: str) -> list:
     ''' Given a CVE it will search for public exploits to abuse it '''
-    
-    return []
-    #TODO: Find a better way to discover exploits
 
-    vulners_api_key = os.getenv('VULNERS_API_KEY')
-    
-    if vulners_api_key:
-        vulners_api = vulners.Vulners(api_key=vulners_api_key)
-        cve_data = vulners_api.searchExploit(cve)
-        return [v['vhref'] for v in cve_data]
-    
-    else:
-        print("VULNERS_API_KEY wasn't configured in the secrets!")
-    
+    # TODO: replace the retired Vulners integration with PoC-in-GitHub / ExploitDB.
     return []
+
+
+################## ENRICHMENT: CISA KEV + EPSS ####################
+
+def fetch_kev_catalog(session=None) -> dict:
+    ''' Fetch the CISA Known Exploited Vulnerabilities catalog, keyed by CVE id '''
+
+    payload = http_get_json(KEV_CATALOG_URL, session=session, label="CISA KEV")
+
+    catalog = {}
+    for entry in payload.get("vulnerabilities") or []:
+        cve_id = entry.get("cveID")
+        if cve_id:
+            catalog[cve_id] = entry
+
+    return catalog
+
+
+def load_kev_catalog(session=None) -> dict:
+    ''' Fetch the KEV catalog, degrading to no enrichment rather than failing the run '''
+
+    if not ENABLE_KEV:
+        return {}
+
+    try:
+        catalog = fetch_kev_catalog(session=session)
+        print(f"Loaded {len(catalog)} CISA KEV entries")
+        return catalog
+
+    except Exception as e:
+        print(f"WARNING: could not load the CISA KEV catalog, continuing without it: {e}")
+        return {}
+
+
+def fetch_epss_scores(cve_ids: list, session=None) -> dict:
+    ''' Look up EPSS scores, batching ids into the sizes the API accepts '''
+
+    scores = {}
+
+    for start in range(0, len(cve_ids), EPSS_BATCH_SIZE):
+        batch = cve_ids[start:start + EPSS_BATCH_SIZE]
+
+        payload = http_get_json(
+            EPSS_API_URL,
+            params={"cve": ",".join(batch), "limit": len(batch)},
+            session=session,
+            label="EPSS",
+        )
+
+        for entry in payload.get("data") or []:
+            cve_id = entry.get("cve")
+            if not cve_id:
+                continue
+
+            # The API returns both figures as strings.
+            try:
+                scores[cve_id] = {
+                    "score": float(entry["epss"]),
+                    "percentile": float(entry["percentile"]),
+                }
+            except (KeyError, TypeError, ValueError):
+                print(f"Skipping malformed EPSS entry for {cve_id}")
+
+    return scores
+
+
+def enrich_cves(cves: list, kev_catalog: dict, session=None):
+    ''' Attach KEV and EPSS data to each CVE in place '''
+
+    for cve in cves:
+        cve["kev"] = kev_catalog.get(cve["id"])
+
+    if not ENABLE_EPSS or not cves:
+        return
+
+    cve_ids = [cve["id"] for cve in cves if cve["id"]]
+    if not cve_ids:
+        return
+
+    try:
+        scores = fetch_epss_scores(cve_ids, session=session)
+    except Exception as e:
+        print(f"WARNING: could not load EPSS scores, continuing without them: {e}")
+        return
+
+    for cve in cves:
+        cve["epss"] = scores.get(cve["id"])
+
+
+def passes_thresholds(cve: dict) -> bool:
+    ''' Apply the severity gates configured on top of the keyword match '''
+
+    in_kev = bool(cve.get("kev"))
+
+    if KEV_ONLY and not in_kev:
+        return False
+
+    # Something already exploited in the wild is worth knowing about whatever it scores.
+    if in_kev and ALWAYS_ALERT_KEV:
+        return True
+
+    if MIN_CVSS is not None:
+        score = cve.get("cvss")
+        if score is None:
+            # Freshly published CVEs are routinely unscored. Hiding them by default
+            # would suppress exactly the alerts this bot exists to deliver.
+            if SKIP_UNSCORED:
+                return False
+        elif score < MIN_CVSS:
+            return False
+
+    if MIN_EPSS is not None:
+        epss = cve.get("epss")
+        if not epss:
+            if SKIP_UNSCORED:
+                return False
+        elif epss["score"] < MIN_EPSS:
+            return False
+
+    return True
+
+
+def filter_by_thresholds(cves: list, label: str) -> list:
+    ''' Drop the CVEs that matched a keyword but fall below the configured gates '''
+
+    kept = [cve for cve in cves if passes_thresholds(cve)]
+
+    dropped = len(cves) - len(kept)
+    if dropped:
+        print(f"Dropped {dropped} {label} CVE(s) below the configured thresholds")
+
+    return kept
 
 
 #################### GENERATE MESSAGES #########################
 
-def generate_new_cve_message(cve_data: dict) -> str:
-    ''' Generate new CVE message for sending to slack '''
+@dataclass(frozen=True)
+class Format:
+    ''' Per-sink escaping, emphasis and length rules '''
 
-    message = f"🚨  *{cve_data['id']}*  🚨\n"
-    message += f"🔮  *CVSS*: {cve_data['cvss']}\n"
-    message += f"📅  *Published*: {cve_data['Published']}\n"
-    message += "📓  *Summary*: " 
-    message += cve_data["summary"] if len(cve_data["summary"]) < 500 else cve_data["summary"][:500] + "..."
-    
+    escape: Callable[[str], str]
+    bold: Callable[[str], str]
+    limit: int
+
+
+def escape_none(text: str) -> str:
+    return text
+
+
+def escape_slack(text: str) -> str:
+    ''' Slack mrkdwn only reserves the three HTML entities '''
+
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+TELEGRAM_SPECIAL_CHARS = r"_*[]()~`>#+-=|{}.!\\"
+
+
+def escape_telegram(text: str) -> str:
+    ''' Escape every character Telegram MarkdownV2 reserves '''
+
+    return "".join("\\" + c if c in TELEGRAM_SPECIAL_CHARS else c for c in text)
+
+
+DISCORD_SPECIAL_CHARS = r"*_~`|>[]()\\"
+
+
+def escape_discord(text: str) -> str:
+    ''' Escape the Discord markdown control characters '''
+
+    return "".join("\\" + c if c in DISCORD_SPECIAL_CHARS else c for c in text)
+
+
+SLACK_FORMAT = Format(escape=escape_slack, bold=lambda s: f"*{s}*", limit=2900)
+TELEGRAM_FORMAT = Format(escape=escape_telegram, bold=lambda s: f"*{s}*", limit=4000)
+DISCORD_FORMAT = Format(escape=escape_discord, bold=lambda s: f"**{s}**", limit=1900)
+NTFY_FORMAT = Format(escape=escape_none, bold=lambda s: s, limit=4000)
+PUSHOVER_FORMAT = Format(escape=escape_none, bold=lambda s: s, limit=1000)
+
+
+def truncate(message: str, limit: int) -> str:
+    ''' Keep a message inside the sink's hard length limit '''
+
+    if len(message) <= limit:
+        return message
+
+    # A single "…" rather than "...", because a dot is a reserved MarkdownV2
+    # character and would need escaping to survive Telegram.
+    cut = message[:limit - 1]
+
+    # Never end on a dangling escape: a trailing backslash makes Telegram reject
+    # the whole message.
+    cut = cut.rstrip("\\")
+
+    return cut + "…"
+
+
+def format_cvss(cve_data: dict) -> str:
+    ''' Human readable score, since NVD leaves unscored CVEs without metrics '''
+
+    score = cve_data.get("cvss")
+    if score is None:
+        return "Unknown"
+
+    severity = cve_data.get("cvss_severity")
+    return f"{score} ({severity})" if severity else str(score)
+
+
+def format_kev(kev: dict) -> str:
+    ''' Summarise a CISA KEV entry: why it matters and by when '''
+
+    details = []
+
+    if kev.get("dateAdded"):
+        details.append(f"added {kev['dateAdded']}")
+
+    if kev.get("dueDate"):
+        details.append(f"US federal remediation due {kev['dueDate']}")
+
+    if (kev.get("knownRansomwareCampaignUse") or "").lower() == "known":
+        details.append("known ransomware use")
+
+    summary = "actively exploited in the wild"
+    return f"{summary} ({', '.join(details)})" if details else summary
+
+
+def format_epss(epss: dict) -> str:
+    ''' Render EPSS as a probability plus how it ranks against every other CVE '''
+
+    # "ranks above N%" rather than "top N%": the latter reads as nonsense for the
+    # low-percentile CVEs that make up most of the catalog.
+    return (f"{epss['score']:.2%} chance of exploitation in the next 30 days "
+            f"(ranks above {epss['percentile']:.0%} of all CVEs)")
+
+
+def enrichment_lines(cve_data: dict, fmt: Format) -> list:
+    ''' The KEV and EPSS lines shared by the new and modified CVE messages '''
+
+    e, b = fmt.escape, fmt.bold
+    lines = []
+
+    kev = cve_data.get("kev")
+    if kev:
+        lines.append(f"🔥  {b(e('CISA KEV'))}{e(': ' + format_kev(kev))}")
+
+    epss = cve_data.get("epss")
+    if epss:
+        lines.append(f"📈  {b(e('EPSS'))}{e(': ' + format_epss(epss))}")
+
+    return lines
+
+
+def generate_new_cve_message(cve_data: dict, fmt: Format = NTFY_FORMAT) -> str:
+    ''' Generate new CVE message for the given sink format '''
+
+    e, b = fmt.escape, fmt.bold
+
+    summary = cve_data["summary"]
+    if len(summary) > SUMMARY_LIMIT:
+        summary = summary[:SUMMARY_LIMIT] + "..."
+
+    # Every literal below is escaped too, not just the CVE data: Telegram rejects
+    # the whole message over one bare "(", and the labels carry punctuation.
+    lines = [
+        f"🚨  {b(e(cve_data['id']))}  🚨",
+        f"🔮  {b(e('CVSS'))}{e(': ')}{e(format_cvss(cve_data))}",
+        f"📅  {b(e('Published'))}{e(': ')}{e(cve_data['Published'])}",
+        f"📓  {b(e('Summary'))}{e(': ')}{e(summary)}",
+    ]
+
+    # KEV and EPSS sit right under the score: they are what makes it actionable.
+    lines[2:2] = enrichment_lines(cve_data, fmt)
+
     if cve_data["vulnerable_configuration"]:
-        message += f"\n🔓  *Vulnerable* (_limit to 10_): " + ", ".join(cve_data["vulnerable_configuration"][:10])
-    
-    message += "\n\n🟢 ℹ️  *More information* (_limit to 5_)\n" + "\n".join(cve_data["references"][:5])
-    
-    message += "\n"
+        vulnerable = ", ".join(cve_data["vulnerable_configuration"][:MAX_CPES_SHOWN])
+        lines.append(f"🔓  {b(e('Vulnerable'))}"
+                     f"{e(f' (limit {MAX_CPES_SHOWN}): ')}{e(vulnerable)}")
 
-    #message += "\n\n(Check the bots description for more information about the bot)\n"
-    
-    return message
+    if cve_data["references"]:
+        lines.append("")
+        lines.append(f"🟢 ℹ️  {b(e('More information'))}{e(f' (limit {MAX_REFS_SHOWN})')}")
+        lines.extend(e(url) for url in cve_data["references"][:MAX_REFS_SHOWN])
 
-
-def generate_modified_cve_message(cve_data: dict) -> str:
-    ''' Generate modified CVE message for sending to slack '''
-
-    message = f"📣 *{cve_data['id']}*(_{cve_data['cvss']}_) was modified the {cve_data['last-modified'].split('T')[0]} (_originally published the {cve_data['Published'].split('T')[0]}_)\n"
-    return message
+    return "\n".join(lines)
 
 
-def generate_public_expls_message(public_expls: list) -> str:
+def generate_modified_cve_message(cve_data: dict, fmt: Format = NTFY_FORMAT) -> str:
+    ''' Generate modified CVE message for the given sink format '''
+
+    e, b = fmt.escape, fmt.bold
+
+    modified = cve_data["last-modified"].split("T")[0]
+    published = cve_data["Published"].split("T")[0]
+
+    tail = (f" ({format_cvss(cve_data)}) was modified on {modified} "
+            f"(originally published {published})")
+
+    lines = [f"📣 {b(e(cve_data['id']))}{e(tail)}"]
+    lines.extend(enrichment_lines(cve_data, fmt))
+
+    return "\n".join(lines)
+
+
+def generate_public_expls_message(public_expls: list, fmt: Format = NTFY_FORMAT) -> str:
     ''' Given the list of public exploits, generate the message '''
 
-    message = ""
+    if not public_expls:
+        return ""
 
-    if public_expls:
-        message = "😈  *Public Exploits* (_limit 20_)  😈\n" + "\n".join(public_expls[:20])
+    e, b = fmt.escape, fmt.bold
+    header = f"😈  {b(e('Public Exploits'))}{e(f' (limit {MAX_EXPLOITS_SHOWN})')}  😈"
 
-    return message
+    return header + "\n" + "\n".join(e(url) for url in public_expls[:MAX_EXPLOITS_SHOWN])
+
+
+def build_message(cve_data: dict, public_expls: list, fmt: Format, is_new: bool) -> str:
+    ''' Render one CVE for one sink, exploits included, within the sink's limit '''
+
+    if is_new:
+        message = generate_new_cve_message(cve_data, fmt)
+    else:
+        message = generate_modified_cve_message(cve_data, fmt)
+
+    expls_message = generate_public_expls_message(public_expls, fmt)
+    if expls_message:
+        message = message + "\n" + expls_message
+
+    return truncate(message, fmt.limit)
 
 
 #################### SEND MESSAGES #########################
 
-def send_slack_mesage(message: str, public_expls_msg: str):
+def send_slack_message(cve_data: dict, public_expls: list, is_new: bool):
     ''' Send a message to the slack group '''
 
     slack_url = os.getenv('SLACK_WEBHOOK')
@@ -237,13 +813,15 @@ def send_slack_mesage(message: str, public_expls_msg: str):
     if not slack_url:
         print("SLACK_WEBHOOK wasn't configured in the secrets!")
         return
-    
+
+    message = build_message(cve_data, public_expls, SLACK_FORMAT, is_new)
+
     json_params = {
         "blocks": [
             {
                 "type": "section",
                 "text": {
-                    "type": "mrkdwn", 
+                    "type": "mrkdwn",
                     "text": message
                 }
             },
@@ -253,92 +831,94 @@ def send_slack_mesage(message: str, public_expls_msg: str):
         ]
     }
 
-    if public_expls_msg:
-        json_params["blocks"].append({
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn", 
-                    "text": public_expls_msg
-                }
-        })
-
-    requests.post(slack_url, json=json_params)
+    r = requests.post(slack_url, json=json_params, timeout=HTTP_TIMEOUT)
+    if r.status_code >= 300:
+        print(f"ERROR SENDING TO SLACK: HTTP {r.status_code} {r.text[:200]}")
 
 
-def send_telegram_message(message: str, public_expls_msg: str):
+def send_telegram_message(cve_data: dict, public_expls: list, is_new: bool):
     ''' Send a message to the telegram group '''
 
     telegram_bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
-    telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')    
+    telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
 
     if not telegram_bot_token:
         print("TELEGRAM_BOT_TOKEN wasn't configured in the secrets!")
         return
-    
+
     if not telegram_chat_id:
         print("TELEGRAM_CHAT_ID wasn't configured in the secrets!")
         return
-    
-    if public_expls_msg:
-        message = message + "\n" + public_expls_msg
 
-    message = message.replace(".", "\\.").replace("-", "\\-").replace("(", "\\(").replace(")", "\\)").replace("_", "").replace("[","\\[").replace("]","\\]").replace("{","\\{").replace("}","\\}").replace("=","\\=")
-    r = requests.get(f'https://api.telegram.org/bot{telegram_bot_token}/sendMessage?parse_mode=MarkdownV2&text={message}&chat_id={telegram_chat_id}')
+    message = build_message(cve_data, public_expls, TELEGRAM_FORMAT, is_new)
+
+    # POST with a JSON body: the summary and reference URLs routinely contain
+    # characters that a GET query string would truncate or mangle.
+    r = requests.post(
+        f"https://api.telegram.org/bot{telegram_bot_token}/sendMessage",
+        json={
+            "chat_id": telegram_chat_id,
+            "text": message,
+            "parse_mode": "MarkdownV2",
+            "disable_web_page_preview": True,
+        },
+        timeout=HTTP_TIMEOUT,
+    )
 
     resp = r.json()
-    if not resp['ok']:
-        r = requests.get(f'https://api.telegram.org/bot{telegram_bot_token}/sendMessage?parse_mode=MarkdownV2&text=Error with' + message.split("\n")[0] + f'{resp["description"]}&chat_id={telegram_chat_id}')
-        resp = r.json()
-        if not resp['ok']:
-            print("ERROR SENDING TO TELEGRAM: "+ message.split("\n")[0] + resp["description"])
+    if not resp.get('ok'):
+        print(f"ERROR SENDING TO TELEGRAM: {cve_data['id']} {resp.get('description')}")
 
-            
-def send_discord_message(message: str, public_expls_msg: str):
+
+def send_discord_message(cve_data: dict, public_expls: list, is_new: bool):
     ''' Send a message to the discord channel webhook '''
 
-    discord_webhok_url = os.getenv('DISCORD_WEBHOOK_URL')
+    discord_webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
 
-    if not discord_webhok_url:
+    if not discord_webhook_url:
         print("DISCORD_WEBHOOK_URL wasn't configured in the secrets!")
         return
-    
-    if public_expls_msg:
-        message = message + "\n" + public_expls_msg
 
-    message = message.replace("(", "\\(").replace(")", "\\)").replace("_", "").replace("[","\\[").replace("]","\\]").replace("{","\\{").replace("}","\\}").replace("=","\\=")
-    webhook = Webhook.from_url(discord_webhok_url, adapter=RequestsWebhookAdapter())
-    if public_expls_msg:
-        message = message + "\n" + public_expls_msg
-    
-    webhook.send(message)
+    message = build_message(cve_data, public_expls, DISCORD_FORMAT, is_new)
 
-def send_pushover_message(message: str, public_expls_msg: str):
+    r = requests.post(discord_webhook_url, json={"content": message}, timeout=HTTP_TIMEOUT)
+    if r.status_code >= 300:
+        print(f"ERROR SENDING TO DISCORD: HTTP {r.status_code} {r.text[:200]}")
+
+
+def send_pushover_message(cve_data: dict, public_expls: list, is_new: bool):
     ''' Send a message to the pushover device '''
 
     pushover_device_name = os.getenv('PUSHOVER_DEVICE_NAME')
     pushover_user_key = os.getenv('PUSHOVER_USER_KEY')
-    pushover_token = os.getenv('PUSHOVER_TOKEN') 
+    pushover_token = os.getenv('PUSHOVER_TOKEN')
 
     if not pushover_device_name:
         print("PUSHOVER_DEVICE_NAME wasn't configured in the secrets!")
-        return 
+        return
     if not pushover_user_key:
         print("PUSHOVER_USER_KEY wasn't configured in the secrets!")
         return
     if not pushover_token:
         print("PUSHOVER_TOKEN wasn't configured in the secrets!")
         return
-    if public_expls_msg:
-        message = message + "\n" + public_expls_msg
 
-    data = { "token": pushover_token, "user": pushover_user_key, "message": message , "device": pushover_device_name}
-    try:
-        r = requests.post("https://api.pushover.net/1/messages.json", data = data)
-    except Exception as e:
-        print("ERROR SENDING TO PUSHOVER: "+ message.split("\n")[0] +message)
+    message = build_message(cve_data, public_expls, PUSHOVER_FORMAT, is_new)
+
+    data = {
+        "token": pushover_token,
+        "user": pushover_user_key,
+        "message": message,
+        "device": pushover_device_name,
+    }
+
+    r = requests.post("https://api.pushover.net/1/messages.json", data=data,
+                      timeout=HTTP_TIMEOUT)
+    if r.status_code >= 300:
+        print(f"ERROR SENDING TO PUSHOVER: HTTP {r.status_code} {r.text[:200]}")
 
 
-def send_ntfy_message(message: str, public_expls_msg: str):
+def send_ntfy_message(cve_data: dict, public_expls: list, is_new: bool):
     ''' Send a message to the ntfy.sh topic '''
 
     ntfy_url = os.getenv('NTFY_URL')
@@ -353,72 +933,124 @@ def send_ntfy_message(message: str, public_expls_msg: str):
         print("NTFY_TOPIC wasn't configured in the environment variables!")
         return
 
-    # Combine message and public exploits message if exists
-    if public_expls_msg:
-        message = message + "\n" + public_expls_msg
+    message = build_message(cve_data, public_expls, NTFY_FORMAT, is_new)
 
-    full_ntfy_url = f"{ntfy_url}/{ntfy_topic}"
+    full_ntfy_url = f"{ntfy_url.rstrip('/')}/{ntfy_topic}"
 
-    headers = {
-        "Title": "New CVE Alert",
-        "Priority": "high",
-    }
+    # Something already being exploited deserves to cut through on a phone.
+    if cve_data.get("kev"):
+        headers = {"Title": "Actively exploited CVE", "Priority": "urgent"}
+    else:
+        headers = {"Title": "New CVE Alert", "Priority": "high"}
 
     if ntfy_auth:
         headers["Authorization"] = ntfy_auth
 
-    print(full_ntfy_url)
-    response = requests.post(full_ntfy_url, data=message.encode('utf-8'), headers=headers)
+    response = requests.post(full_ntfy_url, data=message.encode('utf-8'), headers=headers,
+                             timeout=HTTP_TIMEOUT)
 
     if response.status_code == 200:
         print(f"Notification sent to ntfy.sh topic: {ntfy_topic}")
     else:
-        print(f"Failed to send notification to ntfy.sh. Status code: {response.status_code}, Response: {response.text}")
+        print(f"Failed to send notification to ntfy.sh. Status code: "
+              f"{response.status_code}, Response: {response.text[:200]}")
+
+
+SINKS = (
+    send_slack_message,
+    send_telegram_message,
+    send_discord_message,
+    send_pushover_message,
+    send_ntfy_message,
+)
+
+
+def notify(cve_data: dict, public_expls: list, is_new: bool, dry_run: bool = False):
+    ''' Fan a CVE out to every sink; one broken sink must not abort the run '''
+
+    if dry_run:
+        print("-" * 60)
+        print(build_message(cve_data, public_expls, NTFY_FORMAT, is_new))
+        return
+
+    for sink in SINKS:
+        try:
+            sink(cve_data, public_expls, is_new)
+        except Exception as e:
+            print(f"ERROR in {sink.__name__} for {cve_data['id']}: {e}")
+
 
 #################### MAIN #########################
 
-def main():
-    #Load configured keywords
-    load_keywords()
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Monitor new CVEs matching your keywords.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print the CVEs that would be sent without notifying anyone "
+                             "or updating the saved state.")
+    parser.add_argument("--since-days", type=float, default=None,
+                        help="Ignore the saved state and look back this many days instead.")
+    parser.add_argument("--config", default=KEYWORDS_CONFIG_PATH,
+                        help="Path to the keywords YAML config.")
+    parser.add_argument("--state", default=CVES_JSON_PATH,
+                        help="Path to the JSON file holding the last-run timestamps.")
+    return parser.parse_args(argv)
 
-    #Start loading time of last checked ones
-    load_lasttimes()
 
-    #Find a publish new CVEs
+def main(argv=None):
+    global LAST_NEW_CVE, LAST_MODIFIED_CVE
+
+    args = parse_args(argv)
+
+    # Load configured keywords
+    load_keywords(args.config)
+
+    # Start loading time of last checked ones
+    if args.since_days is not None:
+        since = datetime.datetime.utcnow() - datetime.timedelta(days=args.since_days)
+        LAST_NEW_CVE = since
+        LAST_MODIFIED_CVE = since
+        print(f"Overriding saved state, looking back to {since}")
+    else:
+        load_lasttimes(args.state)
+
+    # Load the KEV catalog once and reuse it for both passes
+    kev_catalog = load_kev_catalog()
+
+    # Find and publish new CVEs
     new_cves = get_new_cves()
+    enrich_cves(new_cves, kev_catalog)
 
+    # Capture the ids before the thresholds run, so a CVE dropped here cannot
+    # reappear moments later as a "modified" alert.
     new_cves_ids = [ncve['id'] for ncve in new_cves]
-    print(f"New CVEs discovered: {new_cves_ids}")
+    new_cves = filter_by_thresholds(new_cves, "new")
+    print(f"New CVEs discovered: {[ncve['id'] for ncve in new_cves]}")
 
     for new_cve in new_cves:
         public_exploits = search_exploits(new_cve['id'])
-        cve_message = generate_new_cve_message(new_cve)
-        public_expls_msg = generate_public_expls_message(public_exploits)
-        send_slack_mesage(cve_message, public_expls_msg)
-        send_telegram_message(cve_message, public_expls_msg)
-        send_discord_message(cve_message, public_expls_msg)
-        send_pushover_message(cve_message, public_expls_msg)
-        send_ntfy_message(cve_message, public_expls_msg)
+        notify(new_cve, public_exploits, is_new=True, dry_run=args.dry_run)
 
-    #Find and publish modified CVEs
+    # Find and publish modified CVEs
     modified_cves = get_modified_cves()
 
-    modified_cves = [mcve for mcve in modified_cves if not mcve['id'] in new_cves_ids]
-    modified_cves_ids = [mcve['id'] for mcve in modified_cves]
-    print(f"Modified CVEs discovered: {modified_cves_ids}")
+    modified_cves = [mcve for mcve in modified_cves if mcve['id'] not in new_cves_ids]
+    enrich_cves(modified_cves, kev_catalog)
+    modified_cves = filter_by_thresholds(modified_cves, "modified")
+    print(f"Modified CVEs discovered: {[mcve['id'] for mcve in modified_cves]}")
 
     for modified_cve in modified_cves:
         public_exploits = search_exploits(modified_cve['id'])
-        cve_message = generate_modified_cve_message(modified_cve)
-        public_expls_msg = generate_public_expls_message(public_exploits)
-        send_slack_mesage(cve_message, public_expls_msg)
-        send_telegram_message(cve_message, public_expls_msg)
-        send_pushover_message(cve_message, public_expls_msg)
-        send_ntfy_message(cve_message, public_expls_msg)
+        notify(modified_cve, public_exploits, is_new=False, dry_run=args.dry_run)
 
-    #Update last times
-    update_lasttimes()
+    # Update last times
+    if args.dry_run:
+        print(f"Dry run: not saving state (would be LAST_NEW_CVE={LAST_NEW_CVE}, "
+              f"LAST_MODIFIED_CVE={LAST_MODIFIED_CVE})")
+    else:
+        update_lasttimes(args.state)
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

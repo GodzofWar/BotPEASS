@@ -36,3 +36,41 @@ PRODUCT_KEYWORDS_I:
 
 PRODUCT_KEYWORDS:
 - ThisIsACaseSensitiveExample
+
+# If the bot has not run for a while, only replay this many days of CVEs
+# rather than flooding every channel with months of backlog.
+# Set to null to disable the limit.
+MAX_BACKFILL_DAYS: 7
+
+# How far back to look when there is no saved state at all.
+LOOKBACK_DAYS: 1
+
+# --- Enrichment -----------------------------------------------------------
+# Both sources are free and need no API key.
+
+# Flag CVEs listed in CISA's Known Exploited Vulnerabilities catalog.
+ENABLE_KEV: yes
+
+# Attach EPSS scores (FIRST's probability of exploitation in the next 30 days).
+ENABLE_EPSS: yes
+
+# --- Alert thresholds -----------------------------------------------------
+# Applied after keyword matching. Leave null/no to alert on every match.
+
+# Drop CVEs scoring below this CVSS base score, e.g. 7.0
+MIN_CVSS: null
+
+# Drop CVEs below this EPSS probability, e.g. 0.1 for a 10% chance
+MIN_EPSS: null
+
+# Alert only on CVEs in the CISA KEV catalog
+KEV_ONLY: no
+
+# A CVE in the KEV catalog is already being exploited, so let it through
+# regardless of MIN_CVSS and MIN_EPSS.
+ALWAYS_ALERT_KEV: yes
+
+# Newly published CVEs often have no CVSS or EPSS score yet. By default they
+# pass the thresholds above rather than being hidden. Set this to yes to drop
+# them instead.
+SKIP_UNSCORED: no

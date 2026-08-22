@@ -1,21 +1,21 @@
 name: botpeas_action
 
 on:
-  #schedule:
-  #  - cron: '0 */8 * * *'
+  schedule:
+    - cron: '0 */8 * * *'
   workflow_dispatch:
-  pull_request:
-    branches: [ "main" ]
-  
+
 jobs:
-  build:
+  monitor:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repo
-        uses: actions/checkout@master
+        uses: actions/checkout@v4
 
       - name: Setup Python
-        uses: actions/setup-python@v2.2.2
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
       - name: Setup Dependencies
         run: python3 -m pip install -r requirements.txt
@@ -24,27 +24,27 @@ jobs:
         run: python3 botpeas.py
         shell: bash
         env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-          VULNERS_API_KEY: ${{ secrets.VULNERS_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          PUSHOVER_DEVICE_NAME: ${{ secrets.PUSHOVER_DEVICE_NAME }}
+          PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
+          PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
           NTFY_URL: ${{ secrets.NTFY_URL }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           NTFY_AUTH: ${{ secrets.NTFY_AUTH }}
 
-      - name: Create local changes
-        run: git add output/botpeas.json
-
       - name: Commit results to Github
         run: |
-            git config --local user.email ""
-            git config --global user.name "BotPEASS"
-            git commit -m "Bot auto update" -a --allow-empty
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "BotPEASS"
+          git add output/botpeas.json
+          git diff --quiet --cached || git commit -m "Bot auto update"
 
       - name: Push changes
-        uses: ad-m/github-push-action@master
+        uses: ad-m/github-push-action@v0.8.0
         with:
-           github_token: ${{ secrets.GITHUB_TOKEN }}
-           branch: ${{ github.ref }}
-
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ github.ref }}
